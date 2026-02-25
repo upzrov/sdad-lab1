@@ -2,7 +2,7 @@
 
 ## 🧠 System Concept
 
-We cannot rely solely on in-memory queues because a user might be offline for days or weeks. If a queue server restarts or overflows, those messages would be lost. Therefore, the architecture prioritizes **persistent storage (the "Inbox" pattern)** over ephemeral message queues for long-term buffering.
+To handle users who might be offline for days or weeks, we rely on a robust message broker. By utilizing RabbitMQ with Durable Exchanges and Lazy Queues, we can safely buffer messages on disk without exhausting system memory. The database transitions to a secondary role as a historical archive, while RabbitMQ handles the active delivery state.
 
 ---
 
@@ -10,46 +10,55 @@ We cannot rely solely on in-memory queues because a user might be offline for da
 
 ### Design Decisions
 
-1. **Persistent Inbox (DB):** We treat the database as the source of truth. Messages are stored permanently immediately upon receipt.
-2. **Push Notification Service:** Since the user is offline, we cannot send the data directly via WebSocket. We must use an external push service (like FCM/APNS) to notify the user to open the app.
-3. **Sync Service:** A dedicated component to handle the logic of "What did I miss?" when a user finally reconnects.
+1. Message Broker (RabbitMQ): Acts as the central nervous system. Each user has a dedicated durable queue. Messages sit safely on disk in RabbitMQ until explicitly acknowledged by the client.
+
+2. Delivery/Routing Worker: A backend service that processes incoming messages, routes them to the correct RabbitMQ queue, and triggers push notifications if the user's WebSocket connection is absent.
+
+3. Archive DB: The database is no longer the "Inbox." It simply acts as a cold-storage archive for chat history, written to asynchronously.
 
 ```mermaid
 graph TD
     Client[Client App Mobile/Web]
     
     subgraph Backend_Infrastructure [Backend Infrastructure]
-        API[API Gateway]
+        API[API Gateway / WebSocket Server]
         Auth[Auth Service]
         MsgService[Message Ingestion Service]
-        SyncService[Offline Sync Service]
-        NotifService[Notification Service]
+        Worker[Routing & Notification Worker]
+    end
+    
+    subgraph Message_Broker [Message Broker]
+        RMQ[[RabbitMQ]]
+        Exchange((Direct Exchange))
+        Q_UserA>Queue: User A]
+        Q_UserB>Queue: User B]
     end
     
     subgraph Persistence_Layer [Persistence Layer]
-        DB[(Primary Database)]
+        DB[(Archive Database)]
         Cache[(Session Cache)]
     end
     
     ExternalPush[External Push Provider FCM/APNS]
 
     %% Flows
-    Client -->|1. Send Msg| API
-    Client -->|2. Reconnect/Fetch| API
-    
+    Client -->|1. Send Msg via WS/HTTP| API
     API --> Auth
     API --> MsgService
-    API --> SyncService
     
-    MsgService -->|Store Message| DB
-    MsgService -->|Trigger Alert| NotifService
+    MsgService -->|Publish| Exchange
+    Exchange -->|Route Key: user.B| Q_UserB
     
-    SyncService -->|Check User Status| Cache
-    SyncService -->|Fetch Missed Msgs| DB
-    
-    NotifService -->|Send Wake-up| ExternalPush
+    Worker -.->|Consume & Monitor| Q_UserB
+    Worker -->|Archive Msg| DB
+    Worker -->|Check Session| Cache
+    Worker -->|If offline, trigger| ExternalPush
     ExternalPush -.->|Push Notification| Client
-
+    
+    Client -->|2. Reconnect WS| API
+    API -->|Subscribe| Q_UserB
+    Q_UserB -->|Push Pending Msgs| API
+    API -->|Deliver| Client
 ```
 
 ---
@@ -58,36 +67,36 @@ graph TD
 
 ### Scenario: User Comeback (Synchronization)
 
-This scenario details the critical moment when **User B comes back online** after being offline. The system must efficiently deliver all missed messages without overwhelming the client.
-
-**Mechanism:** We use a **Cursor-based sync**. The client sends the ID of the last message it received. The server returns everything after that ID.
+This scenario details the moment User B comes back online. Instead of the server querying a database, the WebSocket server simply binds to User B's RabbitMQ queue. RabbitMQ automatically pushes the buffered messages, and the system waits for the client to confirm receipt before deleting them.
 
 ```mermaid
 sequenceDiagram
     participant UserB as User B (Client)
-    participant API as API Gateway
-    participant Sync as Sync Service
-    participant DB as Database
+    participant API as API/WebSocket Node
+    participant RMQ as RabbitMQ (User B Queue)
     participant Cache as Session Cache
 
-    Note over UserB, Cache: User B comes online after 2 days
+    Note over UserB, RMQ: User B comes online after 2 days. Messages are waiting in RabbitMQ.
 
-    UserB->>API: CONNECT (WebSocket / Long Poll)
+    UserB->>API: CONNECT (WebSocket)
     API->>Cache: Update Status = ONLINE
     API-->>UserB: Connected
     
-    Note right of UserB: Client checks local storage,<br/>last received MsgID = 1050
+    Note right of API: API Node subscribes to<br/>User B's durable queue
 
-    UserB->>API: GET /sync/messages?after=1050
-    API->>Sync: fetchMissedMessages(userB, cursor=1050)
-    Sync->>DB: SELECT * FROM messages WHERE to=UserB AND id > 1050
-    DB-->>Sync: Returns [Msg 1051, 1052, 1053]
-    Sync-->>API: List of Messages
-    API-->>UserB: Returns [Msg 1051, 1052, 1053]
+    API->>RMQ: basic.consume(queue='user.b')
+    RMQ-->>API: Deliver Msg 1051
+    RMQ-->>API: Deliver Msg 1052
+    RMQ-->>API: Deliver Msg 1053
+    
+    API-->>UserB: Push [Msg 1051, 1052, 1053] over WebSocket
 
-    UserB->>API: ACK /messages/delivered {ids: [1051, 1052, 1053]}
-    API->>Sync: updateStatus(Delivered)
-    Sync->>DB: UPDATE messages SET status='Delivered'
+    Note right of UserB: Client processes messages<br/>and updates local UI
+
+    UserB->>API: ACK {ids: [1051, 1052, 1053]}
+    API->>RMQ: basic.ack (multiple=true)
+    
+    Note over RMQ: RabbitMQ removes messages<br/>from the queue disk
 
 ```
 
@@ -95,28 +104,28 @@ sequenceDiagram
 
 ## 🔄 Part 3 — State Diagram
 
-### Object: `DeliveryProcess`
+### Object: `MessageDeliveryLifecycle`
 
-This focuses on the lifecycle of the **delivery attempt** specifically for Variant 3. Unlike a standard lifecycle, this handles the "Unreachable" loop.
+With RabbitMQ, the state is primarily managed by the queue itself (Message sits in queue vs. Message is acknowledged).
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Pending : Message Persisted
+    [*] --> Published : Ingested by API
     
-    state "Offline Handling" as OfflineBlock {
-        Pending --> CheckOnline : Trigger Delivery
-        CheckOnline --> PushNotification : User Offline
-        PushNotification --> WaitingForConnection : Push Sent
-        WaitingForConnection --> CheckOnline : Periodic Retry / Timeout
+    Published --> Queued : Routed to User's Durable Queue
+    
+    state "Queue / Buffer State" as BufferBlock {
+        Queued --> NotifyOffline : Worker detects user offline
+        NotifyOffline --> WaitingInQueue : Push Notification Sent
+        WaitingInQueue --> Queued : Sits on disk (Lazy Queue)
     }
     
-    CheckOnline --> Delivering : User Online (Socket Open)
-    Delivering --> Delivered : Client ACK received
+    Queued --> Unacknowledged : Pushed to Connected Consumer (WS)
     
-    Delivered --> [*]
+    Unacknowledged --> Delivered : Client sends ACK
+    Unacknowledged --> Queued : WS Drops (NACK / Requeue)
     
-    %% Error handling
-    Delivering --> Pending : Connection Dropped (NACK)
+    Delivered --> [*] : Removed from RabbitMQ
 
 ```
 
@@ -124,7 +133,7 @@ stateDiagram-v2
 
 ## 📚 Part 4 — ADR (Architecture Decision Record)
 
-### ADR-001: Hybrid Storage Strategy for Offline Buffering
+### ADR-001: Message Broker Strategy for Offline Bufferin
 
 ## Status
 
@@ -132,26 +141,30 @@ Accepted
 
 ## Context
 
-In "Variant 3: Offline Message Delivery," users may be offline for extended periods (weeks).
-We need to decide where to store messages waiting for delivery.
-Standard Message Queues (RabbitMQ/Kafka) are excellent for high throughput but risky for long-term storage (retention limits, memory costs, lack of queryability for specific users).
+In "Variant 3: Offline Message Delivery," users may be offline for extended periods (weeks). We need a reliable mechanism to buffer these messages. Previously, database polling (the Inbox pattern) was considered to avoid overloading memory with millions of idle queues. However, database polling introduces high read latency, database locking issues, and complex cursor-management logic on the client.
 
 ## Decision
 
-We will use **Database-First Buffering (The "Inbox" Pattern)** combined with **Cursor-Based Sync**.
+We will use RabbitMQ with Durable, Lazy Queues as the primary buffer and delivery mechanism.
 
-1. All messages are immediately committed to the primary database (PostgreSQL/Cassandra) upon receipt.
-2. No separate "delivery queue" holds the message payload.
-3. Delivery logic effectively queries the database: `SELECT * FROM messages WHERE recipient_id = X AND status = 'pending'`.
+Every user is assigned a specific routing key and a dedicated Durable Queue in RabbitMQ.
+
+Queues are configured as Lazy Queues (queue.declare with x-queue-mode=lazy). This forces RabbitMQ to write messages immediately to disk rather than keeping them in RAM, perfectly suiting users who are offline for weeks.
+
+We rely on RabbitMQ Consumer Acknowledgements (ACKs). Messages are not removed from the queue until the client explicitly confirms receipt.
+
+The database is strictly used for asynchronous archiving, not active delivery.
 
 ## Alternatives
 
-* **In-Memory Queues (e.g., Redis Lists):** Rejected. If Redis crashes or fills up during a recipient's 2-week vacation, messages are lost.
-* **Durable Message Brokers (e.g., RabbitMQ Durable Queues):** Considered, but rejected. Managing millions of unique queues (one per user) is operationally complex and resource-heavy for long-term dormant users.
+Database-First Buffering (Inbox Pattern): Rejected. High IOPS during "thundering herd" reconnections. Requires complex pagination and cursor state management.
+
+In-Memory Redis Lists: Rejected. High risk of data loss on server restart and prohibitively expensive RAM usage for long-term offline buffering.
 
 ## Consequences
 
-* **Reliability:** Zero data loss if the delivery service crashes; data is safely on disk.
-* **Simplicity:** The client logic is simple ("Give me everything since ID X").
+Reliability: Messages are safely persisted to disk via RabbitMQ. If a WebSocket connection drops mid-delivery, the un-ACKed messages are safely requeued.
 
-* **Database Load:** High IOPS on the database during "thundering herd" scenarios (e.g., everyone comes online at once). We will mitigate this with caching and pagination.
+Simplicity: The backend logic is heavily simplified. The server no longer tracks "what the user missed"; it simply subscribes to the queue, and RabbitMQ handles the cursor and delivery state.
+
+Infrastructure Overhead: We must manage and monitor a RabbitMQ cluster, ensuring disk space is sufficient for the lazy queues and that connection limits are tuned for many idle queues.
